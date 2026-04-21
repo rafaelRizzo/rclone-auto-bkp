@@ -15,17 +15,24 @@ mkdir -p "$LOG_DIR"
 list_jobs() {
     echo "=== BACKUPS CONFIGURADOS ==="
 
+    local found=0
     for file in "$SCRIPTS_DIR"/*.sh; do
         [ -e "$file" ] || continue
+        found=1
 
         JOB_NAME=$(basename "$file" .sh)
-        CRON=$(crontab -l 2>/dev/null | grep "$file" || true)
+        CRON_LINE=$(crontab -l 2>/dev/null | grep "$file" || true)
 
         echo "--------------------------------"
-        echo "Job: $JOB_NAME"
-        echo "Script: $file"
-        echo "Cron: ${CRON:-Não encontrado}"
+        echo "Job:        $JOB_NAME"
+        echo "Script:     $file"
+        echo "Cron:       ${CRON_LINE:-Não encontrado}"
     done
+
+    if [ "$found" -eq 0 ]; then
+        echo "Nenhum job configurado"
+    fi
+    return 0
 }
 
 # =========================
@@ -43,16 +50,31 @@ remove_job() {
     fi
 
     read -p "Confirmar remoção? (y/n): " confirm
-    [ "$confirm" != "y" ] && return
+    if [ "$confirm" != "y" ]; then return; fi
 
     crontab -l 2>/dev/null | grep -v "$SCRIPT_PATH" | crontab -
-
     rm -f "$SCRIPT_PATH"
 
     read -p "Remover arquivos locais também? (y/n): " del
-    [ "$del" = "y" ] && rm -rf "$BACKUP_DIR"
+    if [ "$del" = "y" ]; then rm -rf "$BACKUP_DIR"; fi
 
     echo "Removido com sucesso"
+}
+
+# =========================
+# EXECUTAR JOB AGORA
+# =========================
+run_job() {
+    read -p "Nome do job: " JOB_NAME
+    SCRIPT_PATH="$SCRIPTS_DIR/$JOB_NAME.sh"
+
+    if [ ! -f "$SCRIPT_PATH" ]; then
+        echo "Job não encontrado"
+        return
+    fi
+
+    echo "Executando $JOB_NAME..."
+    bash "$SCRIPT_PATH"
 }
 
 # =========================
@@ -62,16 +84,36 @@ create_job() {
 
     echo "=== CONFIGURADOR DE BACKUP ==="
 
-    read -p "Nome do job: " JOB_NAME
-    read -p "Path local: " LOCAL_PATH
+    # --- Nome do job ---
+    while true; do
+        read -p "Nome do job: " JOB_NAME
+        if [[ ! "$JOB_NAME" =~ ^[a-zA-Z0-9_-]+$ ]]; then
+            echo "Nome inválido (use apenas letras, números, _ e -)"
+            continue
+        fi
+        SCRIPT_PATH="$SCRIPTS_DIR/$JOB_NAME.sh"
+        if [ -f "$SCRIPT_PATH" ]; then
+            echo "Job '$JOB_NAME' já existe. Escolha outro nome."
+            continue
+        fi
+        break
+    done
 
-    # =========================
-    # ESCOLHER REMOTE
-    # =========================
+    # --- Path local ---
+    while true; do
+        read -p "Path local: " LOCAL_PATH
+        if [ ! -e "$LOCAL_PATH" ]; then
+            echo "Path não existe: $LOCAL_PATH"
+            continue
+        fi
+        break
+    done
+
+    # --- Remote rclone ---
     while true; do
         echo ""
         echo "Digite o destino no rclone (ex: drive:backups/app)"
-        echo "ou digite 'l' para listar os remotes configurados"
+        echo "ou 'l' para listar remotes configurados"
         read -p "Destino: " REMOTE_INPUT
 
         if [ "$REMOTE_INPUT" = "l" ]; then
@@ -90,16 +132,32 @@ create_job() {
         REMOTE_NAME=$(echo "$REMOTE_INPUT" | cut -d':' -f1)
 
         if ! rclone listremotes | grep -q "^${REMOTE_NAME}:"; then
-            echo "Remote não existe"
+            echo "Remote '$REMOTE_NAME' não existe"
             continue
         fi
+
+        echo "Testando acesso e criando diretório se necessário..."
+        if ! rclone mkdir "$REMOTE_INPUT" &>/dev/null; then
+            echo "Falha ao acessar/criar '$REMOTE_INPUT'. Verifique permissões."
+            continue
+        fi
+        echo "OK: $REMOTE_INPUT"
 
         REMOTE_PATH="$REMOTE_INPUT"
         break
     done
 
-    read -p "Retenção (dias): " RETENTION_DAYS
+    # --- Retenção ---
+    while true; do
+        read -p "Retenção (dias): " RETENTION_DAYS
+        if [[ ! "$RETENTION_DAYS" =~ ^[0-9]+$ ]] || [ "$RETENTION_DAYS" -lt 1 ]; then
+            echo "Informe um número válido de dias (mínimo 1)"
+            continue
+        fi
+        break
+    done
 
+    # --- Agendamento ---
     echo "1) Hora"
     echo "2) Diário"
     echo "3) Semanal"
@@ -107,16 +165,23 @@ create_job() {
     read -p "Opção: " S
 
     case $S in
-        1) CRON="0 * * * *" ;;
+        1)
+            CRON="0 * * * *"
+            if [ "$RETENTION_DAYS" -lt 1 ]; then
+                echo "⚠ Atenção: backup horário com retenção menor que 1 dia pode acumular muitos arquivos."
+            fi
+            ;;
         2) CRON="0 2 * * *" ;;
         3) CRON="0 2 * * 0" ;;
         4) CRON="0 2 1 * *" ;;
         *) echo "Inválido"; return ;;
     esac
 
-    BACKUP_DIR="$BASE_DIR/$JOB_NAME"
-    SCRIPT_PATH="$SCRIPTS_DIR/$JOB_NAME.sh"
+    # --- Notificação ---
+    NOTIFY_URL=""
+    read -p "Webhook para notificação de falha (deixe vazio para pular): " NOTIFY_URL
 
+    BACKUP_DIR="$BASE_DIR/$JOB_NAME"
     mkdir -p "$BACKUP_DIR"
 
     cat <<EOF > "$SCRIPT_PATH"
@@ -128,6 +193,7 @@ JOB_NAME="$JOB_NAME"
 LOCAL_PATH="$LOCAL_PATH"
 REMOTE_PATH="$REMOTE_PATH"
 RETENTION_DAYS=$RETENTION_DAYS
+NOTIFY_URL="$NOTIFY_URL"
 
 BACKUP_DIR="$BACKUP_DIR"
 LOG_DIR="$LOG_DIR"
@@ -143,13 +209,37 @@ log() {
     echo "[\$(date '+%Y-%m-%d %H:%M:%S')] [\$1] \$2" | tee -a "\$LOG_FILE"
 }
 
-# LOCK
-if [ -f "\$LOCK_FILE" ]; then
-    echo "Já está rodando" >> "\$LOG_FILE"
+notify_failure() {
+    local MSG="\$1"
+    log ERROR "\$MSG"
+    if [ -n "\$NOTIFY_URL" ]; then
+        curl -sf -X POST "\$NOTIFY_URL" \
+            -H "Content-Type: application/json" \
+            -d "{\"text\":\"❌ Backup FALHOU: \${JOB_NAME} — \${MSG}\"}" \
+            &>/dev/null || true
+    fi
+}
+
+FAILED=0
+
+on_exit() {
+    rm -f "\$LOCK_FILE"
+    if [ "\$FAILED" -eq 1 ]; then
+        notify_failure "Erro inesperado — verifique o log: \$LOG_FILE"
+    fi
+}
+
+trap 'FAILED=1' ERR
+trap 'on_exit' EXIT
+
+# =========================
+# LOCK COM PID
+# =========================
+if [ -f "\$LOCK_FILE" ] && kill -0 "\$(cat "\$LOCK_FILE")" 2>/dev/null; then
+    log ERROR "Já está rodando (PID \$(cat "\$LOCK_FILE"))"
     exit 1
 fi
-trap "rm -f \$LOCK_FILE" EXIT
-touch "\$LOCK_FILE"
+echo \$\$ > "\$LOCK_FILE"
 
 START=\$(date +%s)
 
@@ -157,24 +247,27 @@ log INFO "Iniciando backup"
 log INFO "Origem: \$LOCAL_PATH"
 log INFO "Destino: \$REMOTE_PATH"
 
-# validações
+# =========================
+# VALIDAÇÕES
+# =========================
 if [ ! -e "\$LOCAL_PATH" ]; then
-    log ERROR "Path inválido"
+    notify_failure "Path inválido: \$LOCAL_PATH"
     exit 1
 fi
 
 if ! command -v rclone &> /dev/null; then
-    log ERROR "rclone não instalado"
+    notify_failure "rclone não instalado"
     exit 1
 fi
 
-# compactar
+# =========================
+# COMPACTAR (sem -v para não encher log)
+# =========================
 log INFO "Compactando..."
-tar -czvf "\$BACKUP_PATH" -C "\$(dirname "\$LOCAL_PATH")" "\$(basename "\$LOCAL_PATH")" >> "\$LOG_FILE" 2>&1
+tar -czf "\$BACKUP_PATH" -C "\$(dirname "\$LOCAL_PATH")" "\$(basename "\$LOCAL_PATH")" >> "\$LOG_FILE" 2>&1
 
-# validar arquivo
 if [ ! -s "\$BACKUP_PATH" ]; then
-    log ERROR "Arquivo inválido"
+    notify_failure "Arquivo gerado está vazio ou inválido"
     exit 1
 fi
 
@@ -185,34 +278,34 @@ HASH=\$(sha256sum "\$BACKUP_PATH" | awk '{print \$1}')
 log INFO "SHA256: \$HASH"
 
 # =========================
-# UPLOAD (AJUSTADO PARA RATE LIMIT)
+# UPLOAD
 # =========================
-
 log INFO "Upload..."
 
-if timeout 1h rclone copy "\$BACKUP_PATH" "\$REMOTE_PATH" \\
-    --stats 5s \\
-    --stats-one-line \\
-    --log-level INFO \\
-    --retries 5 \\
-    --low-level-retries 10 \\
-    --transfers 1 \\
-    --checkers 2 \\
-    --tpslimit 2 \\
-    --tpslimit-burst 2 \\
+if timeout 1h rclone copy "\$BACKUP_PATH" "\$REMOTE_PATH" \
+    --stats 5s \
+    --stats-one-line \
+    --log-level INFO \
+    --retries 5 \
+    --low-level-retries 10 \
+    --transfers 1 \
+    --checkers 2 \
+    --tpslimit 2 \
+    --tpslimit-burst 2 \
     2>&1 | tee -a "\$LOG_FILE"; then
 
     log INFO "Upload concluído"
 else
-    log ERROR "Erro no upload"
+    notify_failure "Erro no upload para \$REMOTE_PATH"
     exit 1
 fi
 
-# limpar backups antigos
+# =========================
+# LIMPEZA
+# =========================
 find "\$BACKUP_DIR" -type f -mtime +\$RETENTION_DAYS -delete >> "\$LOG_FILE" 2>&1
-
-# limpar logs antigos
-find "\$LOG_DIR" -type f -mtime +15 -delete
+find "\$LOG_DIR" -type f -name "*.log" -mtime +15 -delete
+find "\$LOG_DIR" -type f -name "*.log" -size +50M -delete
 
 END=\$(date +%s)
 DUR=\$((END - START))
@@ -225,7 +318,10 @@ EOF
 
     (crontab -l 2>/dev/null; echo "$CRON $SCRIPT_PATH") | crontab -
 
-    echo "Criado com sucesso"
+    echo ""
+    echo "✅ Job '$JOB_NAME' criado com sucesso"
+    echo "   Cron: $CRON"
+    echo "   Script: $SCRIPT_PATH"
 }
 
 # =========================
@@ -238,7 +334,8 @@ while true; do
     echo "1) Criar"
     echo "2) Listar"
     echo "3) Remover"
-    echo "4) Sair"
+    echo "4) Executar agora"
+    echo "5) Sair"
     echo "============================"
     read -p "Opção: " OP
 
@@ -246,7 +343,8 @@ while true; do
         1) create_job ;;
         2) list_jobs ;;
         3) remove_job ;;
-        4) exit ;;
+        4) run_job ;;
+        5) exit ;;
         *) echo "Inválido" ;;
     esac
 done
