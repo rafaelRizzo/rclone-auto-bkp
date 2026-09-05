@@ -10,8 +10,8 @@ Script interativo para gerenciar backups automatizados com `rclone` e `cron`.
 ## Instalação
 
 ```bash
-chmod +x backup-manager.sh
-./backup-manager.sh
+chmod +x setup-backup.sh
+./setup-backup.sh
 ```
 
 ## Estrutura
@@ -25,11 +25,12 @@ chmod +x backup-manager.sh
 
 ## Funcionalidades
 
-| Opção   | Descrição                                          |
-| ------- | -------------------------------------------------- |
-| Criar   | Configura novo job de backup                       |
-| Listar  | Exibe jobs e agendamentos                          |
-| Remover | Remove job, script e opcionalmente arquivos locais |
+| Opção         | Descrição                                          |
+| ------------- | --------------------------------------------------- |
+| Criar         | Configura novo job de backup                       |
+| Listar        | Exibe jobs e agendamentos                          |
+| Remover       | Remove job, script e opcionalmente arquivos locais |
+| Executar agora | Roda o script do job imediatamente                 |
 
 ## Criando um Job
 
